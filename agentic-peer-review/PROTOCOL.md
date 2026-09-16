@@ -2,7 +2,9 @@
 
 Two coding agents review the same frozen diff. Each is assigned a fixed letter, `A` or `B`,
 by the human. They alternate turns, communicating only through files in a mailbox directory.
-A human triggers each turn or explicitly asks an agent to monitor for its next turn.
+The human launches A and B once with explicit roles and branch. After kickoff, both agents
+monitor autonomously, take their turns without another prompt, and stop only when the session
+closes, blocks, or the human cancels.
 
 This file is the complete specification. It assumes nothing beyond a POSIX shell, `git`, and
 the ability to read and write files. It is not specific to any agent app.
@@ -36,16 +38,27 @@ needs to be checked out and neither agent disturbs the other's working tree.
 5. **Five rounds maximum** (ten round files). Round 5 is the last; the session force-closes after it.
 6. **New findings in rounds 1–3 only.** Rounds 4 and 5 are for resolving what is already on the table.
 7. **A blocker is raised, not worked around.** See **Blockers and the hold**.
-8. **Monitoring is read-only.** Never acquire the lock or write while waiting for the other agent.
+8. **Monitoring is autonomous and read-only.** Never acquire the lock or write while waiting.
+9. **Blind means no-peek.** Neither agent reads peer findings or existing PR review comments
+   before both independent finding sets are fixed and B's commitment is verified.
+10. **Claims are immutable.** Corrections are appended as acknowledged amendments; original
+    claims and evidence are never silently rewritten.
 
 ## Mailbox layout
 
 ```
 <mailbox>/
   PROTOCOL.md       this file, pinned for the session
-  scope.md          what is under review; written once at init
-  state.json        {"round": 1, "turn": "A", "status": "open"|"blocked"|"closed"}
-  findings.md       live ledger: one row per finding, current status
+  scope.md          neutral scope; no existing review findings
+  diff.patch        exact frozen BASE..HEAD input
+  state.json        phase, round, turn and status
+  blind/
+    B.commit.json   digest/size commitment; no finding content
+    A.md            A's fixed independent findings
+    B.md            B's revealed independent findings
+  external-comments.md  fetched only after blind reveal, when applicable
+  findings.md       live ledger: immutable IDs and current state
+  blocker.md        present only while a blocker is held
   lock/             directory; its existence means the lock is held
     owner.txt       "<letter> <ISO-8601 timestamp>", plus " hold" on a blocker hold
   rounds/
@@ -53,10 +66,10 @@ needs to be checked out and neither agent disturbs the other's working tree.
     01-B.md
     02-A.md
     ...
-  summary.md        written by whoever closes the session
+  summary.md        written only by A during finalization
 ```
 
-## Init (once per review, by either agent)
+## Init (once per review, by agent A)
 
 Nobody types a ticket or a session id. Those come from the branch, which the human named:
 
@@ -70,10 +83,20 @@ Nobody types a ticket or a session id. Those come from the branch, which the hum
 
 Write `scope.md` with: branch, session id, full `BASE` and `HEAD` SHAs, PR number if there is
 one, the diff file list (`git diff --stat BASE..HEAD`), the absolute mailbox path, the absolute
-checkout path both agents must use, and the round cap (5).
+checkout path both agents must use, the round cap (5), and the object digest and byte length of
+`diff.patch`. Write the exact `git diff --binary BASE..HEAD` bytes to `diff.patch`; both agents
+review that file and the repository at the pinned refs. Use `git hash-object diff.patch` for the
+digest and `wc -c < diff.patch` for the byte length so both agents can reproduce the checks with
+the protocol's required tools.
 
-Write `state.json` as `{"round": 1, "turn": "A", "status": "open"}`, create `rounds/`, copy this
-file into the mailbox, and initialize `findings.md` with an empty table.
+Do not fetch, summarize, or copy existing bot/human review comments during init. They are
+quarantined until blind reveal.
+
+Write `state.json` as
+`{"phase":"blind_b_commit","round":0,"turn":"B","status":"open"}`, create `blind/` and
+`rounds/`, copy this file into the mailbox, and initialize `findings.md` with an empty table.
+A then releases the lock and monitors. B joins the initialized session once; after that both
+agents advance autonomously.
 
 Neither agent declares what the other one is. You are told your own letter and need nothing else
 about the other side. Record your own app name in the header of each round file you write; that
@@ -95,10 +118,9 @@ Given an explicit mailbox path, use it. Otherwise look under
 ## Taking a turn — exact sequence
 
 1. Read `state.json`.
-   - `status` is `closed` → report the summary in chat (see **Chat report**), stop.
+   - `status` is `closed` → follow **Chat report**, stop.
    - `status` is `blocked` → follow **Blockers and the hold**, do not monitor past it.
-   - `turn` is not your letter → if explicit monitoring is active, follow **Monitoring**;
-     otherwise say whose turn it is and stop. Do not acquire the lock.
+   - `turn` is not your letter → follow **Monitoring**. Do not acquire the lock.
 2. Acquire the lock: `mkdir <mailbox>/lock`. This is atomic, so two agents cannot both succeed.
    - If it fails, the lock is held. Read `lock/owner.txt`. If it says `hold`, it is a blocker
      hold: never break it at any age, and report the blocker to the human instead. Otherwise,
@@ -109,23 +131,23 @@ Given an explicit mailbox path, use it. Otherwise look under
 4. Re-read `state.json`. If `turn` is no longer yours, release the lock and stop. (This closes
    the gap between checking and acting.)
 5. Check `git rev-parse <branch>` against the `HEAD` in `scope.md`. If it moved, release the lock
-   and report to the human.
-6. Do the work for this round (below).
-7. Write `rounds/NN-<letter>.md`, zero-padded round number.
-8. Update `findings.md`.
-9. Update `state.json`: flip `turn` to the other letter; if you are B, increment `round`.
-   If the close test passes, or you just finished round 5 as B, set `status` to `closed`.
-10. If closing, write `summary.md`.
+   and report to the human. Verify `diff.patch` against the digest and byte length in `scope.md`;
+   a mismatch is a blocker.
+6. Do the work for the current phase (below).
+7. Write the phase artifact or `rounds/NN-<letter>.md` when required.
+8. Update `findings.md` during reveal, debate, or finalization.
+9. Update `state.json` using **Phase transitions**.
+10. Only A in `finalize_a` may write `summary.md` and set `status` to `closed`.
 11. Release the lock: `rm -rf <mailbox>/lock`.
-12. Report in chat, then print the handoff line. If explicit monitoring is active and the
-    session remains open, resume **Monitoring**.
+12. Report in chat, print the handoff line while the session remains open, then resume
+    **Monitoring** without waiting for another human prompt.
 
 Releasing the lock is mandatory even when you stop early or hit an error. If you cannot finish a
 round, delete the lock and say so. The single exception is a blocker hold, below.
 
 ## Monitoring
 
-Monitoring is enabled only when the human explicitly requests it. It changes scheduling, not
+Monitoring is enabled by default after each agent's one-time kickoff. It changes scheduling, not
 review semantics:
 
 1. Read `state.json` without acquiring the lock.
@@ -136,6 +158,66 @@ review semantics:
 4. When `turn` names your role, restart **Taking a turn** at step 1.
 5. After your handoff, resume monitoring until the session closes, blocks, or the human cancels.
 
+An app that cannot remain alive or wait autonomously must disclose that limitation at kickoff.
+It must not pretend the other agent needs to be prompted by protocol; the limitation belongs to
+that runtime.
+
+## Phase transitions
+
+`state.json` has this shape:
+
+```
+{"phase":"blind_b_commit"|"blind_a_publish"|"blind_b_reveal"|"debate"|"finalize_a",
+ "round":0|1|2|3|4|5, "turn":"A"|"B", "status":"open"|"blocked"|"closed"}
+```
+
+### 1. `blind_b_commit` — B
+
+B reviews `diff.patch` and the pinned repository without reading any peer or external review.
+B completes the exact text it intends to reveal as `blind/B.md` in its private agent context.
+Before A writes findings, B writes `blind/B.commit.json` containing the content digest, byte
+length, finding count, app/runtime provenance, and timestamp—but no finding content. B sets
+`phase=blind_a_publish`, `turn=A`, releases the lock, and monitors.
+
+Compute the draft digest with `git hash-object --stdin` over the exact bytes retained for reveal;
+compute the byte length over those same bytes. At reveal, `git hash-object blind/B.md` and
+`wc -c < blind/B.md` must match the commitment.
+
+If B loses the committed draft before reveal, it cannot recreate or revise it after A publishes.
+Set a blocker and restart the blind phase or abandon the session.
+
+### 2. `blind_a_publish` — A
+
+A reviews the same frozen input without seeking B's private draft and writes `blind/A.md`.
+A sets `phase=blind_b_reveal`, `turn=B`, releases the lock, and monitors.
+
+### 3. `blind_b_reveal` — B
+
+Before reading `blind/A.md`, B writes the exact committed draft to `blind/B.md` and verifies its
+digest and byte length against `blind/B.commit.json`. A mismatch is a blocker, never a warning.
+Only after verification may B read A's blind file.
+
+B then fetches existing PR review comments, if relevant, into `external-comments.md`; they enter
+the ledger as `X1`, `X2`, ... and carry no truth status until both agents verify them. B
+initializes `findings.md` from the fixed blind files using origin-qualified IDs (`A1`, `A2`, ...,
+`B1`, `B2`, ...; overengineering items use `OA1`, `OB1`, ...), sets `phase=debate`,
+`round=1`, `turn=A`, releases the lock, and monitors.
+
+### 4. `debate` — A then B
+
+A writes `rounds/NN-A.md`, then sets `turn=B` at the same round. B writes `rounds/NN-B.md`, then
+increments the round and sets `turn=A`.
+
+If the close test passes after A's turn, A may proceed directly to `finalize_a`. If it passes
+after B's turn, B sets `phase=finalize_a`, `turn=A`. B finishing round 5 always routes to
+`finalize_a`, whether converged or diverged. B never closes or presents the session.
+
+### 5. `finalize_a` — A
+
+A verifies ledger completeness, claim fidelity, amendments, and the close result. A writes
+`summary.md`, appends the round history, sets `status=closed`, releases the lock, and presents the
+absolute summary link to the human. A is the sole finalizer.
+
 ## Blockers and the hold
 
 A blocker is anything that stops you from reviewing to the depth this protocol demands — that
@@ -145,13 +227,14 @@ fixture or credential is missing, the diff depends on an unmerged change, a refe
 absent, the base looks wrong, or the claim can only be settled against data you have no access
 to and must not obtain yourself.
 
-Agent A carries this duty in round 1, because A reviews first and a defective basis wastes both
-sides' rounds. B may use the same mechanism later if it hits a genuine blocker.
+Both blind reviewers carry this duty. B reviews first under the no-peek gate, so B must hold on
+any defective basis it discovers; A independently does the same during its blind phase. Either
+agent may use the mechanism during debate.
 
 On hitting one:
 
-1. Write your round file with a `## Blocker` section: what is blocked, the specific thing needed
-   to unblock it, and what you were and were not able to verify without it.
+1. Write `blocker.md`: current phase/round/role, what is blocked, the specific thing needed to
+   unblock it, and what you were and were not able to verify without it.
 2. Do **not** flip `turn`. Leave it on your own letter and set `status` to `blocked`.
 3. **Keep the lock.** Rewrite `lock/owner.txt` as `<your letter> <ISO-8601 timestamp> hold`.
    A hold is never stale-breakable, so the other agent cannot start on a basis you already know
@@ -165,55 +248,110 @@ Nothing moves until the human confirms. Then:
 - **Told to proceed anyway** — record in `scope.md` what stayed unverifiable, and mark every
   affected area as not reviewed in depth so it carries into `summary.md`. Findings that needed
   the missing evidence cap at P3 or become `needs-evidence`. Then continue as above.
-- **Abandoned** — set `status` to `closed`, note the blocker as the reason in `summary.md`, and
-  release the lock.
+- **Abandoned** — set `phase=finalize_a`, `turn=A`, keep `status=open`, and release the lock.
+  A records the blocker as the reason in `summary.md` and closes the session.
 
 Do not silently narrow the scope to whatever happens to be reviewable. An unflagged blocker
 turns the whole session into two agents agreeing about code neither of them could actually check.
 
 ## The work
 
-**Round 1, agent A** — independent review of the frozen diff. Raise findings `F1`, `F2`, …
+### Blind phase
 
-**Round 1, agent B** — in this order:
-1. Review the diff yourself **before reading A's round file**, and write your own findings.
-2. Then read `01-A.md` and issue a verdict on each of A's findings.
+Both agents inspect the full frozen scope independently. Blind files contain:
 
-Doing it in that order matters. Reading A's list first anchors you to A's framing and is the
-fastest way to turn a peer review into an echo.
+- defect findings using the format below
+- an `## Overengineering candidates` section using the separate format below, or an explicit
+  `None found` with the areas checked
+- tests, queries, and source material actually inspected
+- the agent's app, model family when known, runtime, and context provenance
 
-**Rounds 2–5, either agent** — in your round file:
-- a verdict on **every** open finding raised by the other side; no silent skips
-- defend or withdraw each of your own findings that was challenged
-- new findings only while `round <= 3`
+The blind packet contains no peer findings and no existing PR review comments. Requirements and
+repository facts supplied in `scope.md` are `GIVEN`; they do not count as corroboration until an
+agent independently verifies and records them as `DERIVED`.
+
+### Debate rounds 1–5
+
+Every debate turn contains:
+
+- an adversarial verdict on **every** open finding and overengineering candidate raised by the
+  other side; no silent skips
+- an adversarial verdict on every external comment still open
+- a defense, acknowledged amendment, or withdrawal for each own finding that was challenged
+- new findings only while `round <= 3`, labeled `derived-during-debate`
+- a short `Round delta` listing new IDs, terminal IDs, amendments, blockers, and evidence added
+
+The finding set freezes after round 3. Rounds 4 and 5 only resolve existing IDs.
 
 ## Finding format
 
 ```
-### F<N> · P<1|2|3> · <short title>
+### <A|B><N> · P<1|2|3> · <short title>
 Location: <path>:<line>
 Claim: one sentence stating the defect.
 Reachability: what calls this, under which config / params / data / environment. If you
   cannot show it is reachable, mark it P3 or withdraw it.
 Failure scenario: concrete inputs or state, leading to the wrong output or crash.
 Evidence: what you actually read or ran — file:line, or command and its output.
+Evidence provenance: GIVEN <source> | DERIVED <agent, source locator>
+Falsifier: the bounded observation that would disprove the claim.
 Proposed patch: minimal diff. Optional.
 ```
 
 Priorities: **P1** a correctness bug shown to be reachable. **P2** real but narrow, conditional,
 or a risk rather than a live defect. **P3** quality, simplification, or a nit.
 
+Claims and falsifiers are immutable. A later correction is an `Amendment` that quotes the old and
+new text and becomes effective only when the originator explicitly accepts it.
+
+## Overengineering format
+
+Every blind review judges whether changed implementation items are unrelated to the stated goal
+or impose large complexity, operational cost, or review surface for negligible gain:
+
+```
+### O<A|B><N> · <short title>
+Location: <path>:<line>
+Core objective: the requirement this change is meant to serve.
+Excess: what is unrelated or disproportionate.
+Cost: implementation, maintenance, operational, or review burden.
+Expected gain: concrete benefit and its likely size.
+Minimal alternative: smaller implementation that preserves the core objective.
+Evidence provenance: GIVEN <source> | DERIVED <agent, source locator>
+Falsifier: what would show the complexity is necessary and proportionate.
+```
+
+Do not call code overengineered merely because it is large or unfamiliar. The candidate must
+connect cost to a small, unproven, or out-of-scope gain. Confirmed overengineering is a
+recommendation to reject or trim that implementation item; it is never edited automatically.
+
 ## Verdicts
 
-Responding to the other side's finding, use exactly one:
+Counter-review begins from attempted disconfirmation. For every peer or external finding, record:
+
+```
+Attack attempted: the concrete guard, counterexample, test, or intended-behavior argument tried.
+Independent evidence: a DERIVED source locator or command result.
+Verdict: <one exact verdict below>
+```
+
+Use exactly one defect verdict:
 
 - `confirmed` — you independently re-derived it. Include your own reachability check and
-  failure scenario. Restating the other agent's reasoning is not verification.
+  failure scenario after a concrete falsification attempt failed.
 - `rejected: <reason-class>` — one of `unreachable`, `guarded-upstream`, `test-disproves`,
-  `misread-code`, `intended-behavior`, `out-of-scope`, `duplicate-of-F<N>`. Include the
+  `misread-code`, `intended-behavior`, `out-of-scope`, `duplicate-of-<ID>`. Include the
   evidence that kills it.
 - `needs-evidence: <what exactly>` — you can neither confirm nor kill it. Name the specific
   artifact that would settle it.
+
+Use exactly one overengineering verdict:
+
+- `confirmed-overengineering` — the peer independently verified disproportionate cost and the
+  smaller alternative.
+- `rejected: related-and-proportionate` — evidence shows the implementation is needed or its
+  cost is proportionate to the expected gain.
+- `needs-evidence: <what exactly>` — the cost, gain, or necessity cannot yet be established.
 
 On your own findings, `withdrawn` means you accept the rebuttal.
 
@@ -223,63 +361,87 @@ Two agents reviewing together drift toward agreement. That is the main failure m
 protocol, and these rules exist to resist it.
 
 - Never write `confirmed` without your own verification trail.
-- While any of the other side's findings are open, make at least one genuine rebuttal attempt
-  per round. Go looking for the reason a finding is wrong, not only reasons it is right.
+- Every counter-review starts with an attack. Lenient agreement, praise, and restatement are not
+  verdict work.
+- While any peer finding is open, try to kill that specific claim using its falsifier before
+  looking for supporting evidence.
 - Mechanism-correct is not the same as reachable. A finding whose path nothing can reach is
   `rejected: unreachable` however elegant the mechanism.
 - A round with zero rejections and zero `needs-evidence` is a signal you did not really try.
-  If that happens, state explicitly what you attempted to break and failed to break.
+  If that happens, list the concrete attacks attempted and why each failed.
 - Priority inflation is itself a defect. Challenge any P1 that carries no reachability argument.
 - Do not negotiate toward the middle. A finding is either shown reachable or it is not; there
   is no splitting the difference to end a round.
+- Repetition of `GIVEN` evidence does not corroborate it. Only independently `DERIVED` evidence
+  can support confirmation.
+- Treat overengineering claims adversarially too: require evidence that the gain is genuinely
+  small and the alternative genuinely preserves the objective.
 
 ## Close test
 
-The session is closed when both hold:
+The session is eligible for A finalization when all hold:
 
-- every finding has a terminal verdict from both sides — `confirmed`, `rejected`, `withdrawn`,
-  `out-of-scope`, or `duplicate`, and
+- every defect finding is terminal: peer-confirmed; peer-rejected and origin-withdrawn; or an
+  accepted duplicate. A defended rejection or `needs-evidence` remains open
+- every overengineering item is terminal: peer `confirmed-overengineering`; or peer
+  `rejected: related-and-proportionate` and origin-withdrawn. A defended rejection or
+  `needs-evidence` remains open
+- every external `X<N>` item has matching terminal verdicts from A and B; disagreement remains
+  open
 - neither side raised a new finding in its most recent round.
 
-Otherwise the session force-closes once B finishes round 5. Anything not terminal at that point
-is recorded as **open / diverged**, carrying both sides' positions.
+Eligibility never closes the session directly. It routes through `finalize_a`. If the conditions
+do not hold when B finishes round 5, B still routes to `finalize_a`; A records **diverged at
+round 5** and preserves each open position.
 
 ## findings.md
 
-A single table, current state only. Detail stays in the round files.
+A single table, current state only. Detail stays in the immutable blind files and append-only
+round responses.
 
 ```
-| ID | P | Title | Location | Raised by | Status |
-|----|---|-------|----------|-----------|--------|
-| F1 | 1 | ...   | path:line| A         | confirmed |
+| ID | Kind | P | Title | Location | Raised by | Peer verdict | Origin response |
+|----|------|---|-------|----------|-----------|--------------|-----------------|
+| A1 | defect | 1 | ... | path:line | A | confirmed | stands |
+| OB1 | overengineering | 3 | ... | path:line | B | confirmed-overengineering | stands |
 ```
 
 ## summary.md
 
-Written by whoever closes. Sections, in order:
+Written only by A in `finalize_a`. A derives status from `findings.md` and the round artifacts;
+summary prose may explain ledger state but may not assign or alter it. Sections, in order:
 
 1. **Status** — `converged at round N` or `diverged at round 5`.
 2. **Confirmed findings** — ordered P1 → P3, each with location, the failure scenario, and the
    proposed patch if there is one.
-3. **Rejected** — one line each: finding, reason class, who killed it.
+3. **Rejected items**
+   - **Overengineering rejected from the implementation** — every
+     `confirmed-overengineering` item with cost, expected gain, and minimal alternative.
+   - **Review findings rejected as false positives** — one line each: finding, reason class,
+     who killed it.
 4. **Open / diverged** — each item with A's position and B's position, and what evidence would
    settle it.
+5. **Round history** — appended last: one brief entry for the blind phase and each debate round,
+   naming each agent's new findings, verdict changes, amendments/withdrawals, blockers, and
+   decisive evidence. Keep each agent-turn to one or two lines.
 
 ## Chat report
 
-Both agents report in their own chat when the session closes — the one that closes it, and the
-other on its next run. Say:
+Agent A alone presents the final result. After writing `summary.md` and closing state, A says:
 
-- the convergence status,
-- then the findings in priority order, P1 first, one line each,
-- or, if diverged, the open items with each side's position.
+```
+Peer review <branch-slug>/<session>: <converged at round N|diverged at round 5>.
+[Open the final peer-review summary](<absolute mailbox path>/summary.md)
+```
 
-Nothing else. No preamble, no restating the protocol.
+If B observes `status=closed`, B reports only that A owns final presentation and stops. B never
+links or restates the summary.
 
 ## Handoff line
 
-End a completed turn with exactly this, so the human can paste it into the other app:
+End every non-final completed turn with exactly this. It is an observability aid; autonomous
+monitoring, not human pasting, advances the session:
 
 ```
-Peer review <branch-slug>/<session>: round <N> written by <letter>. Next: <other letter> — point that agent at <absolute mailbox path>/PROTOCOL.md
+Peer review <branch-slug>/<session>: phase <phase>, round <N> written by <letter>. Next: <other letter> — mailbox <absolute mailbox path>
 ```
