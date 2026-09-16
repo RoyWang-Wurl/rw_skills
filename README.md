@@ -17,3 +17,8 @@ Author: Roy Wang
   - Handles ingesting raw sources, answering questions grounded in wiki pages, linting for broken links and coverage gaps, and filing new analysis back into the wiki
   - Activates for any query or edit touching `llm_wiki/`
   - Integrates with the full research workflow (`/generate-research-project` → `/summarize-research`) as the canonical prior-knowledge layer
+
+- **[/agentic-peer-review](agentic-peer-review/SKILL.md)**: Turn-based peer review between two different coding agents over one frozen diff.
+  - Exchanges findings and verdicts through a locked, gitignored mailbox
+  - Supports explicit read-only monitoring so each agent automatically takes its next turn
+  - Enforces independent verification, concrete failure scenarios, and convergence within five rounds
