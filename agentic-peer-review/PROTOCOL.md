@@ -2,8 +2,9 @@
 
 Two coding agents review the same frozen diff. Each is assigned a fixed letter, `A` or `B`,
 by the human. They alternate turns, communicating only through files in a mailbox directory.
-The human launches A and B once with explicit roles and branch. After kickoff, both agents
-monitor autonomously, take their turns without another prompt, and stop only when the session
+The human launches A and B once with explicit roles and branch. After kickoff, an event-driven
+coordinator resumes the agent named by mailbox state. Without a coordinator, each live agent
+waits on filesystem events and polls only as a fallback. The agents stop only when the session
 closes, blocks, or the human cancels.
 
 This file is the complete specification. It assumes nothing beyond a POSIX shell, `git`, and
@@ -26,6 +27,10 @@ needs to be checked out and neither agent disturbs the other's working tree.
 
 ## Ground rules
 
+These rules constrain reviewer agents. The scheduling-only coordinator may keep runtime handles,
+delivery leases, and completed revisions in its own private storage, but it never writes the
+review mailbox or repository.
+
 1. **Review only.** Never modify a file under review. Never stage, commit, push, or amend.
    Never comment on the pull request or write to GitHub in any way. Fixes are *proposed* as
    diffs inside your round file; the human applies what they accept.
@@ -34,7 +39,7 @@ needs to be checked out and neither agent disturbs the other's working tree.
 3. **Write only on your turn, and only while holding the lock.** Reading needs no lock.
 4. **The diff is frozen** at `BASE..HEAD` recorded in `scope.md`, where `HEAD` is the branch tip
    pinned at init. Check `git rev-parse <branch>` against it before reviewing. If the branch has
-   moved, stop and tell the human — never silently review a different diff.
+   moved, raise a blocker hold — never silently review a different diff.
 5. **Five rounds maximum** (ten round files). Round 5 is the last; the session force-closes after it.
 6. **New findings in rounds 1–3 only.** Rounds 4 and 5 are for resolving what is already on the table.
 7. **A blocker is raised, not worked around.** See **Blockers and the hold**.
@@ -43,6 +48,8 @@ needs to be checked out and neither agent disturbs the other's working tree.
    before both independent finding sets are fixed and B's commitment is verified.
 10. **Claims are immutable.** Corrections are appended as acknowledged amendments; original
     claims and evidence are never silently rewritten.
+11. **State is versioned and atomic.** Every state mutation increments `revision` exactly once
+    and replaces `state.json` through a temporary file plus atomic rename while holding the lock.
 
 ## Mailbox layout
 
@@ -51,7 +58,8 @@ needs to be checked out and neither agent disturbs the other's working tree.
   PROTOCOL.md       this file, pinned for the session
   scope.md          neutral scope; no existing review findings
   diff.patch        exact frozen BASE..HEAD input
-  state.json        phase, round, turn and status
+  state.json        revision, phase, round, turn and status
+  state.json.tmp.*  transient atomic-write file; never read as state
   blind/
     B.commit.json   digest/size commitment; no finding content
     A.md            A's fixed independent findings
@@ -66,6 +74,8 @@ needs to be checked out and neither agent disturbs the other's working tree.
     01-B.md
     02-A.md
     ...
+  finalization.md   append-only A audit log; present for any finalization correction or return
+  recovery.md       append-only stale-lock recovery log; present only after a stale break
   summary.md        written only by A during finalization
 ```
 
@@ -92,11 +102,11 @@ the protocol's required tools.
 Do not fetch, summarize, or copy existing bot/human review comments during init. They are
 quarantined until blind reveal.
 
-Write `state.json` as
-`{"phase":"blind_b_commit","round":0,"turn":"B","status":"open"}`, create `blind/` and
-`rounds/`, copy this file into the mailbox, and initialize `findings.md` with an empty table.
-A then releases the lock and monitors. B joins the initialized session once; after that both
-agents advance autonomously.
+Write `state.json` atomically as
+`{"revision":0,"phase":"blind_b_commit","round":0,"turn":"B","status":"open"}`, create
+`blind/` and `rounds/`, copy this file into the mailbox, and initialize `findings.md` with an
+empty table. A then releases the lock. B joins the initialized session once; after that the
+coordinator or each agent's event watcher advances the review autonomously.
 
 Neither agent declares what the other one is. You are told your own letter and need nothing else
 about the other side. Record your own app name in the header of each round file you write; that
@@ -120,56 +130,86 @@ Given an explicit mailbox path, use it. Otherwise look under
 1. Read `state.json`.
    - `status` is `closed` → follow **Chat report**, stop.
    - `status` is `blocked` → follow **Blockers and the hold**, do not monitor past it.
-   - `turn` is not your letter → follow **Monitoring**. Do not acquire the lock.
+   - `turn` is not your letter → follow **Event-driven coordination**. Do not acquire the lock.
 2. Acquire the lock: `mkdir <mailbox>/lock`. This is atomic, so two agents cannot both succeed.
    - If it fails, the lock is held. Read `lock/owner.txt`. If it says `hold`, it is a blocker
      hold: never break it at any age, and report the blocker to the human instead. Otherwise,
      if its timestamp is older than 30 minutes, you may break it with `rm -rf <mailbox>/lock`
-     and retry — and you must record the break in your round file. Otherwise stop and report
-     who holds it.
+     and retry — and you must append the old owner, age, phase, round, role, and timestamp to
+     `recovery.md`. Otherwise stop and report who holds it.
 3. Write `lock/owner.txt` as `<your letter> <ISO-8601 timestamp>`.
 4. Re-read `state.json`. If `turn` is no longer yours, release the lock and stop. (This closes
-   the gap between checking and acting.)
-5. Check `git rev-parse <branch>` against the `HEAD` in `scope.md`. If it moved, release the lock
-   and report to the human. Verify `diff.patch` against the digest and byte length in `scope.md`;
-   a mismatch is a blocker.
+   the gap between checking and acting.) If a coordinator supplied an expected `revision`, it
+   must also match; a duplicate or superseded delivery is a no-op.
+5. Check `git rev-parse <branch>` against the `HEAD` in `scope.md`, and verify `diff.patch`
+   against the digest and byte length in `scope.md`. Branch drift or a packet mismatch follows
+   **Blockers and the hold**: write `blocker.md`, atomically block state, and retain a hold lock.
 6. Do the work for the current phase (below).
 7. Write the phase artifact or `rounds/NN-<letter>.md` when required.
 8. Update `findings.md` during reveal, debate, or finalization.
-9. Update `state.json` using **Phase transitions**.
+9. Update `state.json` using **Phase transitions**: increment `revision`, write a temporary file
+   in the mailbox, then atomically rename it over `state.json`.
 10. Only A in `finalize_a` may write `summary.md` and set `status` to `closed`.
 11. Release the lock: `rm -rf <mailbox>/lock`.
-12. Report in chat, print the handoff line while the session remains open, then resume
-    **Monitoring** without waiting for another human prompt.
+12. Report in chat and print the handoff line while the session remains open. A configured
+    coordinator now owns resumption; otherwise resume **Event-driven coordination** without
+    waiting for another human prompt.
 
 Releasing the lock is mandatory even when you stop early or hit an error. If you cannot finish a
 round, delete the lock and say so. The single exception is a blocker hold, below.
 
-## Monitoring
+## Event-driven coordination
 
-Monitoring is enabled by default after each agent's one-time kickoff. It changes scheduling, not
-review semantics:
+The mailbox remains the source of truth; the coordinator only schedules agents. A coordinator:
 
-1. Read `state.json` without acquiring the lock.
-2. If `status` is `closed` or `blocked`, report it and stop monitoring.
-3. If `turn` is the other agent, wait before checking again. Use the app's native wait mechanism;
-   if none exists, use a POSIX wait. Do not write, hold a lock, or inspect the other agent's
-   in-progress round while waiting.
-4. When `turn` names your role, restart **Taking a turn** at step 1.
-5. After your handoff, resume monitoring until the session closes, blocks, or the human cancels.
+1. Reconciles the current snapshot at startup and whenever a runtime handle registers, then
+   watches the mailbox directory—not the `state.json` inode—for `state.json` create, write, or
+   rename events. Atomic replacement can change the inode. Watcher overflow also triggers a full
+   reconciliation.
+2. Reads the atomically replaced `state.json` even while `lock/` exists so a blocker hold cannot
+   hide `status=blocked`. Event coalescing is harmless because the latest snapshot is
+   authoritative.
+3. For `status=open`, normally waits until `lock/` is absent, then resumes the runtime handle
+   registered for `turn` and supplies the role, branch, absolute mailbox path, and expected
+   revision. If a non-hold lock is older than 30 minutes, it instead dispatches that same role
+   with `stale_lock_recovery=true`; the reviewer applies step 2 of **Taking a turn** and records
+   the break. The coordinator never breaks a lock itself. Runtime adapters may use an agent SDK,
+   a CLI session resume command, or another explicit prompt API.
+4. Tracks each dispatch as a lease, not as completed delivery. A revision is complete only when
+   state advances beyond it or becomes terminal. A failed resume is retried with backoff. After
+   a lease expires, dispatch only if no lock exists or if step 3 identifies the same revision's
+   non-hold lock as stale and no recovery dispatch is active. Concurrent deliveries for one
+   revision are forbidden. The agent's lock acquisition and revision recheck make sequential
+   duplicate delivery safe.
+5. Never writes mailbox files, assigns verdicts, or breaks locks. Stops dispatching on `blocked`
+   or `closed` and notifies the human.
 
-An app that cannot remain alive or wait autonomously must disclose that limitation at kickoff.
-It must not pretend the other agent needs to be prompted by protocol; the limitation belongs to
-that runtime.
+Runtime handles and credentials stay in coordinator-owned storage, not the mailbox. This keeps
+the protocol vendor-neutral and avoids exposing resumable sessions to the peer reviewer.
+
+Without a coordinator, a live agent uses an observe–arm–recheck loop: read the current revision,
+arm a one-shot filesystem watcher on the mailbox directory (`fswatch`, `inotifywait`,
+`watchfiles`, or the runtime equivalent), immediately reread state to close the arming race, then
+wait. After every wake—even an unrelated mailbox event—reread state and rearm if the revision did
+not advance. Periodically reconcile as a safety net for dropped watcher events. A hook that only
+displays a notification does not count as resumption. If no event watcher is available, poll
+every 30 seconds. Never hold the lock or inspect the other agent's in-progress artifacts while
+waiting.
+
+When state names your role, restart **Taking a turn** at step 1. An app that cannot remain alive,
+register a resumable handle, or wait autonomously must disclose that limitation at kickoff.
 
 ## Phase transitions
 
 `state.json` has this shape:
 
 ```
-{"phase":"blind_b_commit"|"blind_a_publish"|"blind_b_reveal"|"debate"|"finalize_a",
+{"revision":<non-negative integer>,
+ "phase":"blind_b_commit"|"blind_a_publish"|"blind_b_reveal"|"debate"|"finalize_a",
  "round":0|1|2|3|4|5, "turn":"A"|"B", "status":"open"|"blocked"|"closed"}
 ```
+
+Every transition below increments `revision` and atomically replaces `state.json`.
 
 ### 1. `blind_b_commit` — B
 
@@ -177,7 +217,8 @@ B reviews `diff.patch` and the pinned repository without reading any peer or ext
 B completes the exact text it intends to reveal as `blind/B.md` in its private agent context.
 Before A writes findings, B writes `blind/B.commit.json` containing the content digest, byte
 length, finding count, app/runtime provenance, and timestamp—but no finding content. B sets
-`phase=blind_a_publish`, `turn=A`, releases the lock, and monitors.
+`phase=blind_a_publish`, `turn=A`, releases the lock, and hands scheduling to the coordinator or
+its event watcher.
 
 Compute the draft digest with `git hash-object --stdin` over the exact bytes retained for reveal;
 compute the byte length over those same bytes. At reveal, `git hash-object blind/B.md` and
@@ -189,7 +230,7 @@ Set a blocker and restart the blind phase or abandon the session.
 ### 2. `blind_a_publish` — A
 
 A reviews the same frozen input without seeking B's private draft and writes `blind/A.md`.
-A sets `phase=blind_b_reveal`, `turn=B`, releases the lock, and monitors.
+A sets `phase=blind_b_reveal`, `turn=B`, releases the lock, and hands off scheduling.
 
 ### 3. `blind_b_reveal` — B
 
@@ -201,22 +242,38 @@ B then fetches existing PR review comments, if relevant, into `external-comments
 the ledger as `X1`, `X2`, ... and carry no truth status until both agents verify them. B
 initializes `findings.md` from the fixed blind files using origin-qualified IDs (`A1`, `A2`, ...,
 `B1`, `B2`, ...; overengineering items use `OA1`, `OB1`, ...), sets `phase=debate`,
-`round=1`, `turn=A`, releases the lock, and monitors.
+`round=1`, `turn=A`, releases the lock, and hands off scheduling.
 
 ### 4. `debate` — A then B
 
-A writes `rounds/NN-A.md`, then sets `turn=B` at the same round. B writes `rounds/NN-B.md`, then
-increments the round and sets `turn=A`.
+A writes `rounds/NN-A.md`, then sets `turn=B` at the same round. B writes `rounds/NN-B.md`.
+Before round 5, if the close test does not pass, B increments the round and sets `turn=A`.
 
-If the close test passes after A's turn, A may proceed directly to `finalize_a`. If it passes
-after B's turn, B sets `phase=finalize_a`, `turn=A`. B finishing round 5 always routes to
-`finalize_a`, whether converged or diverged. B never closes or presents the session.
+Only B performs normal debate closure, ensuring both agents completed the latest round. If the
+close test passes after B's turn, B sets `phase=finalize_a`, `turn=A` without incrementing the
+round. B finishing round 5 always routes to `finalize_a`, whether converged or diverged. Blocker
+abandonment is the explicit exception described below. B never closes or presents the session.
 
 ### 5. `finalize_a` — A
 
-A verifies ledger completeness, claim fidelity, amendments, and the close result. A writes
-`summary.md`, appends the round history, sets `status=closed`, releases the lock, and presents the
-absolute summary link to the human. A is the sole finalizer.
+A verifies ledger completeness, claim fidelity, amendments, and the close result. Finalization
+is an audit, not another debate turn: A may not reopen a terminal item merely to reargue it.
+
+If finalization came from **Abandoned** under **Blockers and the hold**, A writes an
+`abandoned at <phase/round>` summary from `blocker.md`, closes state, and does not apply the
+normal close test or return to debate.
+
+If the ledger has only a clerical mismatch with immutable artifacts, A corrects the ledger,
+records the correction in `finalization.md`, and re-evaluates the close test. If a concrete
+non-terminal item proves B routed prematurely:
+
+- before round 5, A appends the inconsistency and evidence to `finalization.md`, sets
+  `phase=debate`, increments the round, sets `turn=A`, releases the lock, and hands off
+  scheduling
+- at round 5, A records the item as open/diverged and finalizes; debate cannot resume
+
+Otherwise A writes `summary.md`, appends the round history, sets `status=closed`, releases the
+lock, and presents the absolute summary link to the human. A is the sole finalizer.
 
 ## Blockers and the hold
 
@@ -235,7 +292,8 @@ On hitting one:
 
 1. Write `blocker.md`: current phase/round/role, what is blocked, the specific thing needed to
    unblock it, and what you were and were not able to verify without it.
-2. Do **not** flip `turn`. Leave it on your own letter and set `status` to `blocked`.
+2. Do **not** flip `turn`. Leave it on your own letter, increment `revision`, and atomically set
+   `status` to `blocked`.
 3. **Keep the lock.** Rewrite `lock/owner.txt` as `<your letter> <ISO-8601 timestamp> hold`.
    A hold is never stale-breakable, so the other agent cannot start on a basis you already know
    is defective.
@@ -244,7 +302,8 @@ On hitting one:
 Nothing moves until the human confirms. Then:
 
 - **Unblocked** — verify the unblocking action actually landed, finish the round properly on the
-  same turn and round number, flip `turn`, set `status` back to `open`, release the lock.
+  same turn and round number, perform the phase transition with `status=open`, and release the
+  lock.
 - **Told to proceed anyway** — record in `scope.md` what stayed unverifiable, and mark every
   affected area as not reviewed in depth so it carries into `summary.md`. Findings that needed
   the missing evidence cap at P3 or become `needs-evidence`. Then continue as above.
@@ -390,9 +449,9 @@ The session is eligible for A finalization when all hold:
   open
 - neither side raised a new finding in its most recent round.
 
-Eligibility never closes the session directly. It routes through `finalize_a`. If the conditions
-do not hold when B finishes round 5, B still routes to `finalize_a`; A records **diverged at
-round 5** and preserves each open position.
+Eligibility never closes the session directly. B routes through `finalize_a` after completing
+both turns in the latest round. If the conditions do not hold when B finishes round 5, B still
+routes to `finalize_a`; A records **diverged at round 5** and preserves each open position.
 
 ## findings.md
 
@@ -411,7 +470,8 @@ round responses.
 Written only by A in `finalize_a`. A derives status from `findings.md` and the round artifacts;
 summary prose may explain ledger state but may not assign or alter it. Sections, in order:
 
-1. **Status** — `converged at round N` or `diverged at round 5`.
+1. **Status** — `converged at round N`, `diverged at round 5`, or
+   `abandoned at <phase/round>`.
 2. **Confirmed findings** — ordered P1 → P3, each with location, the failure scenario, and the
    proposed patch if there is one.
 3. **Rejected items**
@@ -423,14 +483,15 @@ summary prose may explain ledger state but may not assign or alter it. Sections,
    settle it.
 5. **Round history** — appended last: one brief entry for the blind phase and each debate round,
    naming each agent's new findings, verdict changes, amendments/withdrawals, blockers, and
-   decisive evidence. Keep each agent-turn to one or two lines.
+   decisive evidence. Include any stale-lock recovery and finalization return. Keep each
+   agent-turn to one or two lines.
 
 ## Chat report
 
 Agent A alone presents the final result. After writing `summary.md` and closing state, A says:
 
 ```
-Peer review <branch-slug>/<session>: <converged at round N|diverged at round 5>.
+Peer review <branch-slug>/<session>: <converged at round N|diverged at round 5|abandoned at phase/round>.
 [Open the final peer-review summary](<absolute mailbox path>/summary.md)
 ```
 
@@ -439,9 +500,9 @@ links or restates the summary.
 
 ## Handoff line
 
-End every non-final completed turn with exactly this. It is an observability aid; autonomous
-monitoring, not human pasting, advances the session:
+End every non-final completed turn with exactly this. It is an observability aid; the coordinator
+or event watcher—not human pasting—advances the session:
 
 ```
-Peer review <branch-slug>/<session>: phase <phase>, round <N> written by <letter>. Next: <other letter> — mailbox <absolute mailbox path>
+Peer review <branch-slug>/<session>: revision <R>, phase <phase>, round <N> written by <letter>. Next: <other letter> — mailbox <absolute mailbox path>
 ```

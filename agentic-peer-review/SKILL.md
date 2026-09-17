@@ -1,6 +1,6 @@
 ---
 name: agentic-peer-review
-description: Run an autonomous turn-based peer review in which two different coding agents review the same frozen diff or PR, commit independent no-peek findings, adversarially challenge each other, and converge. Communication is through files in a gitignored mailbox, never chat-to-chat. Use when asked to start, continue, monitor, or check the status of an agent peer review.
+description: Run an autonomous turn-based peer review in which two different coding agents review the same frozen diff or PR, commit independent no-peek findings, adversarially challenge each other, and converge. An event-driven coordinator or filesystem watcher resumes each agent from versioned mailbox state. Use when asked to start, continue, monitor, or check the status of an agent peer review.
 disable-model-invocation: true
 ---
 
@@ -51,9 +51,10 @@ is not ignored.
 `BASE` and `HEAD` off the named branch. For a PR target, pin the SHAs with
 `gh pr view <n> --json baseRefName,headRefOid,number`. B waits for A's initialized session.
 
-**One open session** → follow its phase and turn exactly. Monitoring is autonomous by default:
-wait read-only while the other agent owns the turn, take over when `state.json` names your role,
-then resume monitoring after handoff.
+**One open session** → follow its phase and turn exactly. Scheduling is autonomous by default:
+prefer a configured event-driven coordinator, otherwise wait read-only on mailbox-directory
+filesystem events, and poll every 30 seconds only if neither is available. Take over when
+`state.json` names your role and its revision is newer than the last delivery.
 
 **Several open sessions** → list them with session id, round and turn, and ask which one.
 
@@ -114,16 +115,35 @@ an implementation item should be rejected.
 
 ## Finishing a turn
 
-Write the phase artifact or round file, update `findings.md` when the phase requires it, update
-`state.json`, release the lock, then print the handoff line from `PROTOCOL.md` for observability.
-Release the lock even if you abort mid-turn.
+Write the phase artifact or round file, update `findings.md` when the phase requires it, increment
+the state revision and atomically replace `state.json`, release the lock, then print the handoff
+line from `PROTOCOL.md` for observability. Release the lock even if you abort mid-turn.
 
-Monitoring is the default after kickoff. Use the app's wait mechanism to watch `state.json`
-read-only; do not acquire the lock or write while it is the other agent's turn. Continue until
-the session closes, blocks, or the human cancels. If the app has no native wait mechanism, use a
-POSIX wait between checks.
+After handoff, a configured coordinator resumes the runtime handle registered for the next role.
+The coordinator is scheduling-only: it reconciles on startup/handle registration, watches the
+mailbox directory, reads terminal state even under a blocker hold, and dispatches open state only
+after the lock disappears. A non-hold lock older than 30 minutes triggers a recovery dispatch to
+the same role, which performs and records the protocol's stale-lock break; the coordinator never
+breaks it. The coordinator keeps one delivery lease per revision and considers delivery complete
+only when state advances; failed or expired deliveries are retried without concurrent duplicates.
+It supplies role, branch, mailbox and expected revision and never writes mailbox files. Runtime
+adapters may use the Cursor SDK, Claude Agent SDK or CLI session resume, or an equivalent
+explicit prompt API.
 
-Agent A alone finalizes the session. When the close test passes—or B finishes round 5—route state
-to `finalize_a`. A writes `summary.md`, including rejected overengineering items and a brief
-round-by-round history, closes the session, and gives the human a Markdown link to the absolute
-summary path. B never presents the final summary.
+Without a coordinator, use the app's wait mechanism around a one-shot filesystem watcher on the
+mailbox directory. Use observe–arm–recheck to close the setup race, reread state after every event,
+rearm after unrelated events, and reconcile periodically in case an event is dropped. Watch the
+directory rather than the `state.json` inode because atomic rename can replace it. A
+notification-only file hook is not sufficient to resume reasoning. Poll every 30 seconds only as
+a fallback. Do not acquire the lock or inspect the peer's in-progress artifacts while waiting;
+continue until the session closes, blocks, or the human cancels.
+
+Agent A alone finalizes the session. Only B performs normal debate closure into `finalize_a`,
+after both agents have completed the latest round or B finishes round 5; blocker abandonment is
+an explicit exception. A audits rather than reargues terminal items. If A finds a concrete
+non-terminal item was closed prematurely, A records it in `finalization.md` and returns to the
+next debate round before round 5; at round 5 it is recorded as diverged. Otherwise A writes
+`summary.md`, including rejected overengineering items and a brief round-by-round history, closes
+the session, and gives the human a Markdown link to the absolute summary path. B never presents
+the final summary. A session explicitly abandoned from a blocker is summarized as
+`abandoned at <phase/round>` rather than forced into converged/diverged status.
