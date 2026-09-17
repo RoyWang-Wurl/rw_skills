@@ -337,7 +337,8 @@ Every debate turn contains:
   other side; no silent skips
 - an adversarial verdict on every external comment still open
 - a defense, acknowledged amendment, or withdrawal for each own finding that was challenged
-- new findings only while `round <= 3`, labeled `derived-during-debate`
+- new findings only while `round <= 3`, labeled `derived-during-debate`, including
+  overengineering candidates that target a peer finding or its proposed patch
 - a short `Round delta` listing new IDs, terminal IDs, amendments, blockers, and evidence added
 
 The finding set freezes after round 3. Rounds 4 and 5 only resolve existing IDs.
@@ -365,13 +366,22 @@ new text and becomes effective only when the originator explicitly accepts it.
 
 ## Overengineering format
 
-Every blind review judges whether changed implementation items are unrelated to the stated goal
-or impose large complexity, operational cost, or review surface for negligible gain:
+An overengineering candidate is one of:
+
+- **Implementation** — a changed item in the frozen diff that is unrelated to the stated goal
+  or imposes large complexity, operational cost, or review surface for negligible gain.
+  Raised in the blind pass, and in debate rounds 1–3 if newly noticed.
+- **Peer finding** — a defect finding raised by the other agent, its proposed patch, or the
+  work it would induce is itself disproportionate to the claimed gain. Raised only in debate,
+  after both blinds are revealed. This is a new `O<letter>N` item, not a substitute for the
+  defect verdict: still `confirmed` / `rejected` / `needs-evidence` the finding, then
+  separately flag the finding or its fix as overengineering.
 
 ```
 ### O<A|B><N> · <short title>
+Target: implementation | finding <ID>
 Location: <path>:<line>
-Core objective: the requirement this change is meant to serve.
+Core objective: the requirement this change (or finding) is meant to serve.
 Excess: what is unrelated or disproportionate.
 Cost: implementation, maintenance, operational, or review burden.
 Expected gain: concrete benefit and its likely size.
@@ -380,9 +390,16 @@ Evidence provenance: GIVEN <source> | DERIVED <agent, source locator>
 Falsifier: what would show the complexity is necessary and proportionate.
 ```
 
-Do not call code overengineered merely because it is large or unfamiliar. The candidate must
-connect cost to a small, unproven, or out-of-scope gain. Confirmed overengineering is a
-recommendation to reject or trim that implementation item; it is never edited automatically.
+When `Target` is `finding <ID>`, Location is that finding's location or the proposed patch;
+Core objective is the defect the finding claims to fix; Excess is why the finding or its fix
+is larger than that defect warrants. Blind files have no peer findings, so they use only
+`Target: implementation` (the field may be omitted there).
+
+Do not call code — or a finding — overengineered merely because it is large or unfamiliar.
+The candidate must connect cost to a small, unproven, or out-of-scope gain. Confirmed
+overengineering is a recommendation to reject or trim that implementation item or that
+finding's proposed patch; it is never edited automatically. Do not raise a peer-finding
+candidate in order to skip verdicting the defect.
 
 ## Verdicts
 
@@ -434,7 +451,9 @@ protocol, and these rules exist to resist it.
 - Repetition of `GIVEN` evidence does not corroborate it. Only independently `DERIVED` evidence
   can support confirmation.
 - Treat overengineering claims adversarially too: require evidence that the gain is genuinely
-  small and the alternative genuinely preserves the objective.
+  small and the alternative genuinely preserves the objective. A peer-finding candidate is
+  not a polite way to reject a real defect; if the defect is real, confirm it and OE only
+  the oversized patch.
 
 ## Close test
 
@@ -477,6 +496,8 @@ summary prose may explain ledger state but may not assign or alter it. Sections,
 3. **Rejected items**
    - **Overengineering rejected from the implementation** — every
      `confirmed-overengineering` item with cost, expected gain, and minimal alternative.
+     For `Target: finding <ID>`, the recommendation is to drop or shrink that finding's
+     proposed patch.
    - **Review findings rejected as false positives** — one line each: finding, reason class,
      who killed it.
 4. **Open / diverged** — each item with A's position and B's position, and what evidence would

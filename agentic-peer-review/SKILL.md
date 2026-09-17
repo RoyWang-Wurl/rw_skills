@@ -100,8 +100,11 @@ blind file:
   against live data before asserting it
 - classify evidence as `GIVEN` or independently `DERIVED`; repetition of a given fact is not
   corroboration
-- include an explicit overengineering pass: identify unrelated complexity or large effort for
-  negligible gain, with the core objective, cost, expected gain, and minimal alternative
+- include an explicit overengineering pass on the frozen diff: identify unrelated complexity
+  or large effort for negligible gain, with the core objective, cost, expected gain, and
+  minimal alternative. In debate, also flag a peer finding or its proposed patch when the
+  recommended change is disproportionate to the claimed defect — as a new `O<letter>N`
+  item, not in place of the defect verdict
 
 ## Verdicts on the other side's findings
 
@@ -111,7 +114,8 @@ test, or establish intended behavior. Record `Attack attempted`, `Evidence`, and
 `confirmed` is valid only after a concrete attack fails and the premise is independently derived;
 otherwise use `rejected: <reason-class>` or `needs-evidence: <what>`. Restating the peer's argument
 is not verification. Apply the same attack to overengineering candidates before agreeing that
-an implementation item should be rejected.
+an implementation item or a peer finding's proposed patch should be rejected. In rounds 1–3 a
+new overengineering candidate may target a peer finding; still verdict the finding as a defect.
 
 ## Finishing a turn
 
