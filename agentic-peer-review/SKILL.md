@@ -113,9 +113,12 @@ it: challenge reachability, inspect upstream guards, construct a counterexample,
 test, or establish intended behavior. Record `Attack attempted`, `Evidence`, and `Verdict`.
 `confirmed` is valid only after a concrete attack fails and the premise is independently derived;
 otherwise use `rejected: <reason-class>` or `needs-evidence: <what>`. Restating the peer's argument
-is not verification. Apply the same attack to overengineering candidates before agreeing that
-an implementation item or a peer finding's proposed patch should be rejected. In rounds 1–3 a
-new overengineering candidate may target a peer finding; still verdict the finding as a defect.
+is not verification. Proportionality arguments come from a fixed seat — A argues future
+maintenance cost, B argues minimal-solution cost — and seats apply to overengineering items
+only; defect verdicts rest on reachability and evidence alone. Apply the same attack to
+overengineering candidates before agreeing that an implementation item or a peer finding's
+proposed patch should be rejected. In rounds 1–3 a new overengineering candidate may target a
+peer finding; still verdict the finding as a defect.
 
 ## Finishing a turn
 

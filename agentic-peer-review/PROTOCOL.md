@@ -313,6 +313,21 @@ Nothing moves until the human confirms. Then:
 Do not silently narrow the scope to whatever happens to be reviewable. An unflagged blocker
 turns the whole session into two agents agreeing about code neither of them could actually check.
 
+## Seats
+
+Both agents apply the same standard to facts. They argue proportionality from opposite seats:
+
+- **A holds the future-maintenance seat** — the cost of living with this code: the next change
+  to the same surface, the next reader, the next migration.
+- **B holds the minimal-solution seat** — the cost of the change itself: the smallest
+  implementation that meets the stated objective.
+
+Seats apply **only** to overengineering items. Defect verdicts are seat-free, so agreement on a
+defect still means two independent derivations rather than two agents playing their parts.
+
+A seat picks the argument you make, never the verdict you write. Conceding against your own seat
+when the evidence runs that way is expected; record it as `verdict against seat`.
+
 ## The work
 
 ### Blind phase
@@ -450,6 +465,8 @@ protocol, and these rules exist to resist it.
   is no splitting the difference to end a round.
 - Repetition of `GIVEN` evidence does not corroborate it. Only independently `DERIVED` evidence
   can support confirmation.
+- A seat is not a verdict. Confirming a peer's `O` item because it falls on your side of the
+  seat line, or rejecting one because it does not, is collusion with your own role.
 - Treat overengineering claims adversarially too: require evidence that the gain is genuinely
   small and the alternative genuinely preserves the objective. A peer-finding candidate is
   not a polite way to reject a real defect; if the defect is real, confirm it and OE only
